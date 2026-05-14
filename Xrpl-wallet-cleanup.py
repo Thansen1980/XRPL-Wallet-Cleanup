@@ -55,6 +55,9 @@ PAUSE_BETWEEN_TX = 3
 # ══════════════════════════════════════════════════════════════════════════════
 TF_IMMEDIATE_OR_CANCEL = 0x00020000
 TF_SELL                = 0x00080000
+# TrustSet flags (TS_ prefix to distinguish from OfferCreate flags)
+TS_SET_NO_RIPPLE       = 0x00020000  # Match Xaman: set NoRipple on our side
+TS_CLEAR_FREEZE        = 0x00200000  # Clear our side of any freeze
 BURN_ADDRESS           = "rrrrrrrrrrrrrrrrrrrrhoLvTp"  # XRPL black hole (no one holds the key)
 
 
@@ -301,6 +304,7 @@ def remove_trustline(client: JsonRpcClient, wallet: Wallet,
                 issuer=issuer,
                 value="0",
             ),
+            flags=TS_SET_NO_RIPPLE | TS_CLEAR_FREEZE,
         )
         tx          = autofill(tx, client)
         stx         = sign(tx, wallet)
@@ -403,15 +407,33 @@ def main() -> None:
                 steps.append("Balance = 0 — no send needed")
             steps.append("Remove trustline  (TrustSet limit=0)")
 
+            # Fetch raw line for diagnostics (esp. for zero-balance stuck lines)
+            raw = next(
+                (l for l in all_lines
+                 if l["account"] == iss and l["currency"].upper() == cur.upper()),
+                None,
+            )
+            limit_peer = raw.get("limit_peer", "0") if raw else "?"
+            peer_auth  = raw.get("peer_authorized", False) if raw else "?"
+
             line_single()
-            print(f"  TOKEN  : {display_currency(cur)}")
-            print(f"  ISSUER : {iss}")
-            print(f"  BALANCE: {bal}")
+            print(f"  TOKEN      : {display_currency(cur)}")
+            print(f"  ISSUER     : {iss}")
+            print(f"  BALANCE    : {bal}")
             bids_txt = f"{dex['count']} bid(s)" if dex["has_bids"] else "none"
-            print(f"  DEX    : {bids_txt}")
-            print(f"  PLAN   :")
+            print(f"  DEX        : {bids_txt}")
+            if bal_dec == 0:
+                no_ripple      = raw.get("no_ripple", False) if raw else "?"
+                no_ripple_peer = raw.get("no_ripple_peer", False) if raw else "?"
+                zombie = (limit_peer != "0" or peer_auth or no_ripple_peer)
+                stuck_flag = " ← ZOMBIE (peer flag — cannot remove)" if zombie else " ← ok"
+                print(f"  LIMIT_PEER    : {limit_peer}")
+                print(f"  PEER_AUTH     : {peer_auth}")
+                print(f"  NO_RIPPLE     : {no_ripple}")
+                print(f"  NO_RIPPLE_PEER: {no_ripple_peer}{stuck_flag}")
+            print(f"  PLAN       :")
             for i, step in enumerate(steps, 1):
-                print(f"           {i}. {step}")
+                print(f"             {i}. {step}")
 
         line_single()
         line_double()
@@ -482,8 +504,22 @@ def main() -> None:
         # ── Remove trustline ─────────────────────────────────────────────────
         if send_ok:
             print("  → Removing trustline...")
-            tl_ok  = remove_trustline(client, wallet, cur, iss)
-            status = "✓ CLEANED" if tl_ok else "✗ TRUSTLINE_ERROR"
+            tl_ok = remove_trustline(client, wallet, cur, iss)
+
+            if tl_ok:
+                # Verify the line is actually gone from the ledger
+                time.sleep(1)
+                still_there = any(
+                    l["account"] == iss and l["currency"].upper() == cur.upper()
+                    for l in get_all_trustlines(client, addr)
+                )
+                if still_there:
+                    print("  [WARN] tesSUCCESS but trustline still exists (ledger-level zombie).")
+                    status = "✗ STUCK_ZOMBIE"
+                else:
+                    status = "✓ CLEANED"
+            else:
+                status = "✗ TRUSTLINE_ERROR"
         else:
             print("  [SKIP] Skipping trustline removal due to send failure.")
             status = "✗ SEND_ERROR"
@@ -498,15 +534,44 @@ def main() -> None:
     # ── Final summary ─────────────────────────────────────────────────────────
     line_double()
     print("\nSUMMARY\n")
-    cleaned = [s for s in summary if s[2].startswith("✓")]
-    failed  = [s for s in summary if not s[2].startswith("✓")]
 
-    for cur, iss, status in summary:
-        print(f"  {status:<22}  {display_currency(cur)}  /  {iss}")
+    cleaned = [s for s in summary if s[2] == "✓ CLEANED"]
+    zombies = [s for s in summary if s[2] == "✗ STUCK_ZOMBIE"]
+    errors  = [s for s in summary if s[2] not in ("✓ CLEANED", "✗ STUCK_ZOMBIE")]
 
-    print()
-    print(f"  Cleaned : {len(cleaned)}")
-    print(f"  Failed  : {len(failed)}")
+    if cleaned:
+        print(f"  ✓ CLEANED ({len(cleaned)})")
+        for cur, iss, _ in cleaned:
+            print(f"      {display_currency(cur)[:50]:<50}  {iss}")
+        print()
+
+    if errors:
+        print(f"  ✗ ERRORS ({len(errors)})")
+        for cur, iss, status in errors:
+            print(f"      [{status}]  {display_currency(cur)[:40]:<40}  {iss}")
+        print()
+
+    if zombies:
+        print(f"  ✗ STUCK_ZOMBIE ({len(zombies)})  — cannot be removed by holder")
+        print("     The issuer has lsfNoRipple set on their side of the trust line.")
+        print("     XRPL protocol requires flags=0 before a RippleState object can be deleted.")
+        print("     The issuer must clear their side — holders have no recourse.")
+        print("     Each zombie costs 2 XRP in owner reserve (permanently locked).")
+        print()
+        # Group by issuer for readability
+        issuers: dict[str, list[str]] = {}
+        for cur, iss, _ in zombies:
+            issuers.setdefault(iss, []).append(display_currency(cur))
+        for iss, tokens in issuers.items():
+            print(f"      Issuer: {iss}  ({len(tokens)} token(s))")
+            for t in tokens:
+                print(f"        • {t}")
+        print()
+
+    print(f"  Total processed : {len(summary)}")
+    print(f"  Cleaned         : {len(cleaned)}")
+    print(f"  Zombie (stuck)  : {len(zombies)}  (~{len(zombies) * 2} XRP reserve locked)")
+    print(f"  Other errors    : {len(errors)}")
     print()
 
 
